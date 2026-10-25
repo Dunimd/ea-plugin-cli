@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -21,8 +20,6 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-from __future__ import annotations
-
 """ea-plugin-cli -- the Encre Agent plugin market unified toolchain.
 
 This package provides the ``encre-plugin`` command-line interface that
@@ -36,5 +33,7 @@ requiring ``encre-harness`` or any plugin code to be installed.  The CLI
 entry-point logic that drives argparse and subprocess orchestration lives
 in :mod:`ea_plugin_cli.__main__`.
 """
+
+from __future__ import annotations
 
 __version__ = "0.1.0"

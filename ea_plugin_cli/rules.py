@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -21,14 +20,14 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-from __future__ import annotations
-
 """Shared publish-time rules for the Encre Agent plugin central repository.
 
 Pure functions over already-parsed data (pyproject dict, manifest dict,
 artifact digests) so both the CLI and the registry-repo CI can import
 this module without ``encre-harness`` or any plugin code being installed.
 """
+
+from __future__ import annotations
 
 import hashlib
 import re
@@ -193,10 +192,7 @@ def validate_for_publish(
     # ship PREBUILT inside the wheel — no build steps at install time.
     contributes = manifest.get("contributes") or {}
     wants_ui = bool(
-        manifest.get("provides_ui")
-        or contributes.get("ui")
-        or contributes.get("ui_contributions")
-        or contributes.get("ui_providers")
+        manifest.get("provides_ui") or contributes.get("ui") or contributes.get("ui_contributions") or contributes.get("ui_providers")
     )
     if wants_ui:
         pkg_data = py.get("tool", {}).get("setuptools", {}).get("package-data") or {}

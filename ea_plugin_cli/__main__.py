@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
@@ -21,8 +20,6 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-from __future__ import annotations
-
 """encre-plugin — the Encre Agent plugin market unified CLI.
 
 Commands:
@@ -37,6 +34,8 @@ Build info (``dist/ea-build-info.json``) is the handoff between stages:
 it carries the catalog entry with per-artifact sha256 digests so the
 registry CI and the market installer never have to re-hash by hand.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -203,7 +202,7 @@ def _esbuild_cmd(pkg_dir: Path) -> list[str]:
     return []  # unreachable
 
 
-def _validate_ui_contract(pkg_dir: Path, source: Path, output: Path) -> dict[str, Any]:
+def _validate_ui_contract(source: Path, output: Path) -> dict[str, Any]:
     """Check plugin UI code against the host's single contract.
 
     Unknown `ea-ui-*` classes, RPC names and slot ids fail the build: shipping
@@ -221,7 +220,8 @@ def _validate_ui_contract(pkg_dir: Path, source: Path, output: Path) -> dict[str
     unknown_classes = sorted(used_classes - classes - modules)
     if unknown_classes:
         _fail(
-            "unknown plugin UI class(es): " + ", ".join(unknown_classes)
+            "unknown plugin UI class(es): "
+            + ", ".join(unknown_classes)
             + "\n  these names are not in the host contract; use EA_UI_CLASS_MAP / EA_UI_MODULE_NAMES"
         )
 
@@ -285,7 +285,8 @@ def _build_frontend(pkg_dir: Path) -> dict[str, Any] | None:
         return None
     output = module_dir / UI_OUTPUT
     output.parent.mkdir(parents=True, exist_ok=True)
-    cmd = _esbuild_cmd(pkg_dir) + [
+    cmd = [
+        *_esbuild_cmd(pkg_dir),
         str(source),
         "--bundle",
         "--format=iife",
@@ -301,7 +302,7 @@ def _build_frontend(pkg_dir: Path) -> dict[str, Any] | None:
         _fail("plugin frontend build produced no output")
     if output.stat().st_size > UI_INLINE_MAX:
         _fail(f"{UI_OUTPUT} is {output.stat().st_size} bytes; the runtime inline limit is {UI_INLINE_MAX}")
-    report = _validate_ui_contract(pkg_dir, source, output)
+    report = _validate_ui_contract(source, output)
     print(f"frontend: {source.relative_to(pkg_dir)} -> {output.relative_to(pkg_dir)} ({output.stat().st_size} bytes)")
     return {
         "source": str(source.relative_to(pkg_dir)),
