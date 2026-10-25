@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,14 +21,14 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
-"""Shared publish-time rules for the plugin central repository.
+from __future__ import annotations
+
+"""Shared publish-time rules for the Encre Agent plugin central repository.
 
 Pure functions over already-parsed data (pyproject dict, manifest dict,
 artifact digests) so both the CLI and the registry-repo CI can import
-this module without encre-harness or any plugin code being installed.
+this module without ``encre-harness`` or any plugin code being installed.
 """
-
-from __future__ import annotations
 
 import hashlib
 import re
@@ -40,13 +41,14 @@ from typing import Any
 #: are expected to use.
 PACKAGE_PREFIX = "ea-plugin-"
 
-#: Reserved PyPI namespaces accepted by the central repository.  ea-tool-/
-#: ea-skill- are the vendor prefixes the Encre build pipeline publishes the
-#: official packages under — one registry, three namespaces, same gates.
+#: Reserved PyPI namespaces accepted by the central repository.  ``ea-tool-``
+#: and ``ea-skill-`` are the vendor prefixes the Encre build pipeline
+#: publishes the official packages under — one registry, three namespaces,
+#: same policy gates.
 RESERVED_PREFIXES = ("ea-plugin-", "ea-tool-", "ea-skill-")
 
 #: Only third-party tiers may enter the central repository by default; the
-#: vendor pipeline widens this to the bundled system-default tier.
+#: vendor pipeline widens this to the bundled ``system-default`` tier.
 CENTRAL_TIERS = {"user"}
 VENDOR_TIERS = ("user", "system-default")
 
@@ -54,12 +56,21 @@ _ENTRY_TARGET_RE = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
 
 
 def normalize_module(name: str) -> str:
-    """Turn a plugin name into a PEP 508-ish importable module slug."""
+    """Turn a plugin name into a PEP 508-compatible importable module slug.
+
+    Strips all non-alphanumeric characters and replaces them with underscores,
+    then lowercases the result.  This ensures the module is importable under
+    any filesystem encoding.
+    """
     return re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_").lower()
 
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
-    """Hex sha256 digest of a distribution file (streamed)."""
+    """Compute the hex sha256 digest of a distribution file, streamed in 1 MiB chunks.
+
+    Streaming avoids loading the entire wheel into memory, which matters for
+    large packages on memory-constrained CI runners.
+    """
     h = hashlib.sha256()
     with path.open("rb") as fh:
         while True:
@@ -87,13 +98,14 @@ def find_ea_entrypoint(py: dict[str, Any]) -> tuple[str, str] | None:
     Looks at ``[project.entry-points."ea.plugins"]`` — the same group the
     registry's entry-point discovery consumes.  Returns ``None`` when the
     package declares no EA entry point.
+
+    Multi-entry packages are not supported by the central repository (one
+    catalog entry per distribution); this function returns the first entry
+    and leaves multi-entry validation to ``validate_for_publish``.
     """
     group = (py.get("project", {}).get("entry-points") or {}).get("ea.plugins") or {}
     if not group:
         return None
-    # A package publishing several plugins is not supported by the central
-    # repository (one catalog entry per distribution); take the first and
-    # let validation flag multi-entry packages explicitly.
     ((name, target),) = group.items()
     return str(name), str(target)
 
@@ -105,20 +117,26 @@ def validate_for_publish(
     extra_entry_points: int = 0,
     allowed_tiers: tuple[str, ...] | None = None,
 ) -> list[str]:
-    """Check a plugin package against the central-repository policy.
+    """Check a plugin package against the central-repository publishing policy.
+
+    Validates distribution name prefix, entry-point declaration, entry-point
+    target format, entry-point/manifest identity contract, version agreement
+    between manifest and pyproject, required metadata fields, tier eligibility,
+    list-type constraints on permissions/tags/dependencies, and the frontend
+    prebuild rule (UI assets must ship prebuilt inside the wheel).
 
     Args:
-        py: The parsed ``pyproject.toml``.
+        py: The parsed ``pyproject.toml`` dict.
         manifest: ``PluginManifest.to_dict()`` output from the package.
-        extra_entry_points: Count of additional ``ea.plugins`` entries
-            beyond the first (multi-plugin wheels).
+        extra_entry_points: Count of additional ``ea.plugins`` entries beyond
+            the first (multi-plugin wheels).
         allowed_tiers: Tiers permitted into the index; ``None`` means the
             community default (``user`` only).  The vendor pipeline passes
             :data:`VENDOR_TIERS` so bundled ``system-default`` packages can
             be published to the same registry.
 
     Returns:
-        Violation messages; empty means the package may be published.
+        List of violation messages; empty means the package may be published.
     """
     problems: list[str] = []
     tiers = set(allowed_tiers) if allowed_tiers else set(CENTRAL_TIERS)
@@ -173,7 +191,13 @@ def validate_for_publish(
 
     # Frontend rule: anything the plugin wants rendered in the desktop must
     # ship PREBUILT inside the wheel — no build steps at install time.
-    wants_ui = bool(manifest.get("provides_ui") or (manifest.get("contributes") or {}).get("ui"))
+    contributes = manifest.get("contributes") or {}
+    wants_ui = bool(
+        manifest.get("provides_ui")
+        or contributes.get("ui")
+        or contributes.get("ui_contributions")
+        or contributes.get("ui_providers")
+    )
     if wants_ui:
         pkg_data = py.get("tool", {}).get("setuptools", {}).get("package-data") or {}
         patterns = [p for plist in pkg_data.values() for p in (plist if isinstance(plist, list) else [plist])]
@@ -189,7 +213,13 @@ def build_catalog_entry(
     artifacts: dict[str, dict[str, Any]],
     published_at: str,
 ) -> dict[str, Any]:
-    """Assemble the ea-cwh catalog entry for one published plugin.
+    """Assemble the ea-cwh catalog entry document for one published plugin.
+
+    Extracts the relevant fields from the manifest dict and packages them
+    into the catalog schema format.  The ``provides`` dict is filtered to
+    non-empty lists so the catalog entry stays compact.  The downstream
+    ``validate_catalog`` in ``ea-cwh`` enforces the full schema before the
+    entry reaches the market.
 
     Args:
         manifest: ``PluginManifest.to_dict()`` output.
@@ -198,8 +228,7 @@ def build_catalog_entry(
         published_at: ISO-8601 UTC timestamp of the PyPI upload.
 
     Returns:
-        A catalog entry document (validated downstream by ea-cwh's
-        ``validate_catalog`` before it reaches the market).
+        A catalog entry document.
     """
     provides = {
         "tools": list(manifest.get("provides_tools") or []),
@@ -214,6 +243,7 @@ def build_catalog_entry(
         "name": manifest.get("name", ""),
         "pypi_package": pypi_package,
         "version": manifest.get("version", ""),
+        "display_name": manifest.get("display_name", ""),
         "description": manifest.get("description", ""),
         "author": manifest.get("author", ""),
         "icon": manifest.get("icon", ""),
@@ -237,7 +267,15 @@ def merge_catalog(entries: list[dict[str, Any]], *, registry_url: str = "https:/
     """Merge per-plugin entries into a full catalog document.
 
     Sorting by plugin name keeps regenerated documents diff-stable, so CI
-    diffs show real changes only.
+    diffs show real changes only rather than reordering noise.
+
+    Args:
+        entries: List of individual catalog entry dicts.
+        registry_url: The canonical PyPI registry URL to stamp in the document.
+
+    Returns:
+        A catalog document with ``schema_version``, ``generated_at``,
+        ``registry``, and a sorted ``plugins`` list.
     """
     from ea_cwh import SCHEMA_VERSION  # schema lives in the index package
 
@@ -250,6 +288,7 @@ def merge_catalog(entries: list[dict[str, Any]], *, registry_url: str = "https:/
 
 
 def _utc_now() -> str:
+    """Return the current UTC time as an ISO-8601 timestamp with second precision."""
     from datetime import datetime
 
     return datetime.now(UTC).isoformat(timespec="seconds")

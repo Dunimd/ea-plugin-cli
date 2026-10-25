@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
-# The Encre project belongs to the Dunimd Team.
+# This file is part of Encre Agent.
+# The Encre Agent project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,28 +21,32 @@
 # DISCLAIMER: Users must comply with applicable AI regulations.
 # Non-compliance may result in service termination or legal liability.
 
+from __future__ import annotations
+
 """encre-plugin — the Encre Agent plugin market unified CLI.
 
-    encre-plugin init     <name>       scaffold an ea-plugin-* package
-    encre-plugin build    [pkg_dir]    policy-check + wheel/sdist + digests
-    encre-plugin verify   [pkg_dir]    isolated install + entry-point smoke
-    encre-plugin publish  [pkg_dir]    twine upload + registry PR
-    encre-plugin catalog  regen|check  rebuild / validate catalog.json
+Commands:
+    init <name>        Scaffold an ea-plugin-* package directory
+    sdk [--out DIR]    Materialise the plugin UI SDK package
+    build [pkg_dir]    Frontend compile + policy-check + wheel/sdist + digests
+    verify [pkg_dir]   Isolated install + entry-point smoke test
+    publish [pkg_dir]  PyPI upload + registry PR
+    catalog regen|check  Rebuild or validate catalog.json
 
 Build info (``dist/ea-build-info.json``) is the handoff between stages:
 it carries the catalog entry with per-artifact sha256 digests so the
 registry CI and the market installer never have to re-hash by hand.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -70,17 +75,18 @@ print(json.dumps(plugin.manifest.to_dict()))
 
 
 def _fail(msg: str, code: int = 1) -> None:
+    """Print an error message to stderr and exit with the given code."""
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(code)
 
 
 def _host_python() -> str:
-    """Interpreter the CLI drives `python -m build / venv / twine` with.
+    """Resolve the Python interpreter the CLI shells out to for build/verify/publish.
 
-    A PyInstaller-frozen exe is not a Python interpreter, so the compiled
-    ``encre-plugin`` resolves a real system Python (>= 3.11) from PATH
-    instead.  An unfrozen run keeps ``sys.executable``, so dev environments
-    (editable installs, project venvs) behave exactly as before.
+    A PyInstaller-frozen executable is not itself a Python interpreter, so
+    the compiled ``encre-plugin`` binary searches PATH for a real Python
+    >= 3.11.  An unfrozen run (dev environments with editable installs or
+    project venvs) keeps ``sys.executable`` unchanged.
     """
     if not getattr(sys, "frozen", False):
         return sys.executable
@@ -94,11 +100,12 @@ def _host_python() -> str:
 
 
 def _ensure_pytools(py: str, *mods: str) -> None:
-    """Make the host interpreter able to import the PyPA helper modules.
+    """Install missing PyPA helper modules into the host interpreter on first use.
 
     The download-and-run promise: nobody pip-installs a toolchain before
     using the exe, so a missing helper (build / twine) is installed into
-    the host interpreter on first use — silent when already present.
+    the host interpreter silently when absent.  ``--user`` is tried first;
+    if refused (inside a venv) it falls back to a plain install.
     """
     missing = [m for m in mods if subprocess.run([py, "-c", f"import {m}"], capture_output=True).returncode != 0]
     if not missing:
@@ -115,17 +122,17 @@ def _ensure_pytools(py: str, *mods: str) -> None:
 
 
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Execute a subprocess, capturing stdout/stderr without raising on failure."""
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=False, env=env)
 
 
 def _load_manifest(pkg_dir: Path) -> dict[str, Any]:
-    """Run the package's factory (declared in ea.plugins) and read its manifest.
+    """Run the package's entry-point factory in a subprocess and return its manifest dict.
 
-    Executed in a subprocess against the host interpreter: the frozen CLI exe
-    has no ``encre`` importable in itself, and the author's consent to run
-    their own plugin code is expressed by invoking the CLI.  The market never
-    imports anything this way — it reads the catalog entry baked at build
-    time instead.
+    The frozen CLI exe has no ``encre`` importable inside it, so the
+    factory is invoked as a subprocess against the host interpreter.
+    The market never imports plugin code this way — it reads the catalog
+    entry baked at build time instead.
     """
     py = read_pyproject(pkg_dir)
     ep = find_ea_entrypoint(py)
@@ -140,6 +147,257 @@ def _load_manifest(pkg_dir: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         _fail(f"factory {ep[1]!r} printed non-JSON: {r.stdout[:200]!r} ({exc})")
         return {}  # unreachable
+
+
+# ── plugin UI SDK / frontend compilation ─────────────────────────────
+
+UI_SOURCES = ("ui/src/index.ts", "ui/src/index.tsx", "ui/src/index.js", "ui/src/index.mjs")
+UI_OUTPUT = "ui/plugin.js"
+UI_INLINE_MAX = 512 * 1024
+_UI_ROW_TYPES = {"toggle", "select", "text", "number", "textarea", "color", "button"}
+
+
+def _sdk_dir() -> Path:
+    """Locate the embedded SDK distribution (source checkout or frozen exe)."""
+    here = Path(__file__).resolve().parent
+    candidates = [here / "sdk_dist"]
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.insert(0, Path(sys._MEIPASS) / "ea_plugin_cli" / "sdk_dist")  # type: ignore[attr-defined]
+    candidates.append(Path(__file__).resolve().parents[2] / "sdk" / "dist")
+    for cand in candidates:
+        if (cand / "contract.json").is_file():
+            return cand
+    _fail("plugin UI SDK is missing (sdk_dist/contract.json not found); reinstall ea-plugin-cli")
+    return Path()  # unreachable
+
+
+def _ui_contract() -> dict[str, Any]:
+    try:
+        return json.loads((_sdk_dir() / "contract.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _fail(f"cannot read plugin UI contract: {exc}")
+        return {}
+
+
+def _esbuild_cmd(pkg_dir: Path) -> list[str]:
+    """Resolve an esbuild invocation without requiring a pinned install."""
+    env_bin = os.environ.get("ENCRE_ESBUILD")
+    if env_bin and Path(env_bin).is_file():
+        return [env_bin]
+    on_path = shutil.which("esbuild")
+    if on_path:
+        return [on_path]
+    repo = Path(__file__).resolve().parents[2]
+    names = ("esbuild.cmd", "esbuild") if os.name == "nt" else ("esbuild",)
+    for root in (pkg_dir / "node_modules/.bin", repo / "desktop/node_modules/.bin"):
+        for name in names:
+            cand = root / name
+            if cand.is_file():
+                return [str(cand)]
+    npx = shutil.which("npx")
+    if npx:
+        if os.name == "nt" and npx.lower().endswith((".cmd", ".bat")):
+            return [os.environ.get("COMSPEC", "cmd.exe"), "/c", npx, "--yes", "esbuild@0.28.0"]
+        return [npx, "--yes", "esbuild@0.28.0"]
+    _fail("esbuild not found — install it (`npm i -D esbuild`) or set ENCRE_ESBUILD")
+    return []  # unreachable
+
+
+def _validate_ui_contract(pkg_dir: Path, source: Path, output: Path) -> dict[str, Any]:
+    """Check plugin UI code against the host's single contract.
+
+    Unknown `ea-ui-*` classes, RPC names and slot ids fail the build: shipping
+    a typo produces an unstyled or dead control at runtime, which is exactly
+    the failure this SDK is meant to prevent.
+    """
+    contract = _ui_contract()
+    classes = set((contract.get("classes") or {}).keys())
+    modules = set(contract.get("modules") or [])
+    rpc = set(contract.get("rpc") or [])
+    slots = set((contract.get("slots") or {}).values())
+    text = source.read_text(encoding="utf-8", errors="replace") + "\n" + output.read_text(encoding="utf-8", errors="replace")
+
+    used_classes = set(re.findall(r"\bea-ui-[a-z0-9-]+", text))
+    unknown_classes = sorted(used_classes - classes - modules)
+    if unknown_classes:
+        _fail(
+            "unknown plugin UI class(es): " + ", ".join(unknown_classes)
+            + "\n  these names are not in the host contract; use EA_UI_CLASS_MAP / EA_UI_MODULE_NAMES"
+        )
+
+    # Only dotted names are checked: plain `call("myAction")` is plugin code,
+    # not an EA-UI RPC.
+    used_rpc = set(re.findall(r"\bcall\s*\(\s*[\"']([a-z0-9-]+\.[a-z0-9-]+)[\"']", text))
+    unknown_rpc = sorted(used_rpc - rpc)
+    if unknown_rpc:
+        _fail("unknown EA-UI RPC method(s): " + ", ".join(unknown_rpc) + "\n  see EA_UI_RPC_NAMES")
+
+    used_slots = set(re.findall(r"\bsetSlot\s*\(\s*[\"']([a-z0-9_.-]+)[\"']", text))
+    used_slots |= set(re.findall(r"\bslot\s*:\s*[\"']([a-z0-9_.-]+)[\"']", text))
+    unknown_slots = sorted(used_slots - slots)
+    if unknown_slots:
+        _fail("unknown plugin slot id(s): " + ", ".join(unknown_slots) + "\n  see PLUGIN_SLOTS")
+    return {
+        "classes": sorted(used_classes),
+        "rpc": sorted(used_rpc),
+        "slots": sorted(used_slots),
+    }
+
+
+def _module_dir(pkg_dir: Path) -> Path:
+    """Locate the Python package directory that owns `ui/` assets."""
+    try:
+        py = read_pyproject(pkg_dir)
+    except SystemExit:
+        py = {}
+    except Exception:
+        py = {}
+    name = normalize_module(str((py.get("project") or {}).get("name", "")))
+    cand = pkg_dir / name
+    if name and cand.is_dir():
+        return cand
+    for found in pkg_dir.glob("*/ui"):
+        if found.is_dir():
+            return found.parent
+    for found in pkg_dir.glob("*/ui/src/index.*"):
+        return found.parent.parent
+    return pkg_dir
+
+
+def _resolve_ui_asset(pkg_dir: Path, rel: str) -> Path | None:
+    """Resolve a manifest UI path against the module dir first, then project root."""
+    for base in (_module_dir(pkg_dir), pkg_dir):
+        target = (base / rel).resolve()
+        if target.is_file():
+            return target
+    return None
+
+
+def _build_frontend(pkg_dir: Path) -> dict[str, Any] | None:
+    """Compile `ui/src/index.*` into the prebuilt `ui/plugin.js` asset.
+
+    The install side never runs a build; this is the only place plugin
+    frontend code is compiled.
+    """
+    module_dir = _module_dir(pkg_dir)
+    source = next((module_dir / rel for rel in UI_SOURCES if (module_dir / rel).is_file()), None)
+    if source is None:
+        return None
+    output = module_dir / UI_OUTPUT
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _esbuild_cmd(pkg_dir) + [
+        str(source),
+        "--bundle",
+        "--format=iife",
+        "--platform=browser",
+        "--target=es2020",
+        "--legal-comments=none",
+        f"--outfile={output}",
+    ]
+    r = _run(cmd, cwd=pkg_dir)
+    if r.returncode != 0:
+        _fail(f"plugin frontend build failed:\n{r.stdout}\n{r.stderr}")
+    if not output.is_file() or output.stat().st_size == 0:
+        _fail("plugin frontend build produced no output")
+    if output.stat().st_size > UI_INLINE_MAX:
+        _fail(f"{UI_OUTPUT} is {output.stat().st_size} bytes; the runtime inline limit is {UI_INLINE_MAX}")
+    report = _validate_ui_contract(pkg_dir, source, output)
+    print(f"frontend: {source.relative_to(pkg_dir)} -> {output.relative_to(pkg_dir)} ({output.stat().st_size} bytes)")
+    return {
+        "source": str(source.relative_to(pkg_dir)),
+        "output": str(output.relative_to(pkg_dir)),
+        "bytes": output.stat().st_size,
+        **report,
+    }
+
+
+def _validate_ui_references(manifest: dict[str, Any], pkg_dir: Path) -> None:
+    """Validate the manifest's declarative UI entries before packaging."""
+    contributes = manifest.get("contributes") if isinstance(manifest, dict) else None
+    entries = (contributes or {}).get("ui_contributions") if isinstance(contributes, dict) else None
+    if not entries:
+        return
+    if not isinstance(entries, list):
+        _fail("contributes.ui_contributions must be a list")
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            _fail(f"ui_contributions[{idx}] must be an object")
+        kind = str(entry.get("kind", "") or "")
+        spec = entry.get("spec")
+        if not kind or not isinstance(spec, dict):
+            _fail(f"ui_contributions[{idx}] needs kind + object spec")
+        if kind not in {"theme", "settings", "context_menu", "search_mode", "ui_override", "js_module"}:
+            _fail(f"ui_contributions[{idx}] has unknown kind {kind!r}")
+        if kind == "js_module":
+            if spec.get("code"):
+                continue
+            rel = spec.get("path")
+            if not isinstance(rel, str) or not rel:
+                _fail(f"ui_contributions[{idx}] js_module needs path (or inline code)")
+            if _resolve_ui_asset(pkg_dir, rel) is None:
+                _fail(f"ui_contributions[{idx}] js_module path does not exist: {rel}")
+        elif kind == "ui_override":
+            if not spec.get("slot"):
+                _fail(f"ui_contributions[{idx}] ui_override needs slot")
+            if spec.get("template"):
+                continue
+            rel = spec.get("template_path")
+            if not isinstance(rel, str) or not rel:
+                _fail(f"ui_contributions[{idx}] ui_override needs template or template_path")
+            if _resolve_ui_asset(pkg_dir, rel) is None:
+                _fail(f"ui_contributions[{idx}] template_path does not exist: {rel}")
+        elif kind == "settings":
+            rows = spec.get("rows")
+            if not isinstance(rows, list) or not rows:
+                _fail(f"ui_contributions[{idx}] settings needs rows")
+            for r_i, row in enumerate(rows):
+                if not isinstance(row, dict) or not row.get("id") or not row.get("label"):
+                    _fail(f"ui_contributions[{idx}].rows[{r_i}] needs id + label")
+                if row.get("type") not in _UI_ROW_TYPES:
+                    _fail(f"ui_contributions[{idx}].rows[{r_i}] has invalid type {row.get('type')!r}")
+                if row.get("type") == "select" and not isinstance(row.get("options"), list):
+                    _fail(f"ui_contributions[{idx}].rows[{r_i}] select needs options")
+        elif kind == "theme":
+            if not isinstance(spec.get("css"), str) or not spec.get("css").strip():
+                _fail(f"ui_contributions[{idx}] theme needs non-empty css")
+        elif kind == "context_menu":
+            if not spec.get("label"):
+                _fail(f"ui_contributions[{idx}] context_menu needs label")
+        elif kind == "search_mode":
+            if not spec.get("id") or not spec.get("label"):
+                _fail(f"ui_contributions[{idx}] search_mode needs id + label")
+
+
+def _ui_module_referenced(manifest: dict[str, Any], rel: str) -> bool:
+    contributes = manifest.get("contributes") if isinstance(manifest, dict) else None
+    entries = (contributes or {}).get("ui_contributions") if isinstance(contributes, dict) else None
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("kind") != "js_module":
+            continue
+        spec = entry.get("spec") if isinstance(entry.get("spec"), dict) else {}
+        if isinstance(spec.get("path"), str) and spec["path"].replace("\\", "/").lstrip("/") == rel:
+            return True
+    return False
+
+
+def _verify_wheel_ui_assets(wheel: Path, manifest: dict[str, Any]) -> None:
+    """Ensure every file-backed UI reference is actually inside the wheel."""
+    contributes = manifest.get("contributes") if isinstance(manifest, dict) else None
+    entries = (contributes or {}).get("ui_contributions") if isinstance(contributes, dict) else None
+    if not entries:
+        return
+    with zipfile.ZipFile(wheel) as zf:
+        names = set(zf.namelist())
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        spec = entry.get("spec") if isinstance(entry.get("spec"), dict) else {}
+        rel = spec.get("path") if entry.get("kind") == "js_module" else spec.get("template_path")
+        if not isinstance(rel, str) or not rel:
+            continue
+        wanted = rel.replace("\\", "/").lstrip("/")
+        if not any(name == wanted or name.endswith("/" + wanted) for name in names):
+            _fail(f"wheel is missing declared UI asset: {rel}")
 
 
 # ── init ──────────────────────────────────────────────────────────────
@@ -181,15 +439,21 @@ class {cls}Plugin(EncrePlugin):
     manifest = PluginManifest(
         name="{name}",
         version="0.1.0",
+        display_name="{title}",
         description="{title}",
-        icon="puzzle",
+        icon="",  # the plugin's own glyph: asset path, lucide name, or emoji
         author="Author",
         license="Apache-2.0",
         tags=["example"],
         tier="user",
         min_ea_version="0.5.0",
-        permissions=["tools:register"],
+        permissions=["tools:register", "ui:register"],
         provides_tools=[],
+        contributes={{
+            "ui_contributions": [
+                {{"kind": "js_module", "spec": {{"path": "ui/plugin.js"}}}},
+            ]
+        }},
     )
 
     def get_tools(self):
@@ -212,10 +476,53 @@ Encre Agent plugin `{name}`, built with `encre-plugin`.
 
 Frontend assets (if any) must be PREBUILT into `{module}/ui/` before
 publishing; the installer never runs a build step.
+
+- `{module}/ui/src/index.ts` — plugin UI source (SDK vendored beside it)
+- `encre-plugin build` compiles it to `{module}/ui/plugin.js` and validates
+  every `ea-ui-*` class / RPC name against the host contract
+"""
+
+_UI_ENTRY_TMPL = """\
+import {{ definePluginUi }} from "../vendor/encre-plugin-ui-sdk/index.js";
+
+// Runs inside the host's sandboxed worker. `render` replaces this plugin's
+// own root; `actions.send()` reaches the plugin's backend handler.
+definePluginUi({{
+  render: () => `
+    <div class="ea-ui-card" style="padding:12px;max-width:320px">
+      <div class="ea-ui-row">
+        <div class="ea-ui-row-info">
+          <div class="ea-ui-row-title">{title}</div>
+          <div class="ea-ui-row-desc">Rendered by the Encre plugin UI SDK.</div>
+        </div>
+        <span class="ea-ui-switch"><span class="ea-ui-switch-slider"></span></span>
+      </div>
+    </div>`,
+}});
+"""
+
+_UI_README_TMPL = """\
+# {title} UI
+
+`src/index.ts` is compiled by `encre-plugin build` into `../plugin.js`.
+
+- Import controls from `vendor/encre-plugin-ui-sdk/`.
+- Use `ea-ui-*` classes; the SDK contract lists every valid name.
+- Slots: `PLUGIN_SLOTS` (session.row, model.provider-row).
+- Backend calls: `actions.send(kind, action, payload)`.
+- Host capabilities: `call("dialog.confirm", ...)` (worker only for
+  element-scoped RPCs; iframe providers get the safe subset).
 """
 
 
 def cmd_init(args: argparse.Namespace) -> None:
+    """Scaffold a new ea-plugin-* package directory with pyproject.toml, plugin.py, and README.
+
+    The distribution name is auto-prefixed with ``ea-plugin-`` when the user
+    omits it.  The module name is derived from the distribution name via
+    PEP 508 normalisation.  Templates are string-substituted; no further
+    code generation occurs.
+    """
     name = args.name
     dist = name if name.startswith(PACKAGE_PREFIX) else f"{PACKAGE_PREFIX}{name}"
     module = normalize_module(dist)
@@ -227,18 +534,46 @@ def cmd_init(args: argparse.Namespace) -> None:
     (root / module).mkdir(parents=True)
     (root / module / "ui").mkdir()
     (root / module / "ui" / ".gitkeep").write_text("", encoding="utf-8")
+    (root / module / "ui" / "src").mkdir()
+    (root / module / "ui" / "src" / "index.ts").write_text(_UI_ENTRY_TMPL.format(title=title), encoding="utf-8")
+    (root / module / "ui" / "README.md").write_text(_UI_README_TMPL.format(title=title), encoding="utf-8")
+    vendor = root / module / "ui" / "vendor" / "encre-plugin-ui-sdk"
+    shutil.copytree(_sdk_dir(), vendor)
     (root / "pyproject.toml").write_text(_PYPROJECT_TMPL.format(dist=dist, title=title, ep_name=name, module=module), encoding="utf-8")
     (root / module / "__init__.py").write_text(f'"""{dist}."""\n', encoding="utf-8")
     (root / module / "plugin.py").write_text(_PLUGIN_PY.format(title=title, cls=cls, name=name), encoding="utf-8")
     (root / "README.md").write_text(_README_TMPL.format(dist=dist, name=name, module=module), encoding="utf-8")
-    print(f"created {dist}/ (module {module}) — edit {module}/plugin.py, then run: encre-plugin build {dist}")
+    print(f"created {dist}/ (module {module}) - edit {module}/plugin.py + {module}/ui/src/index.ts, then run: encre-plugin build {dist}")
+
+
+# ── sdk ───────────────────────────────────────────────────────────────
+
+
+def cmd_sdk(args: argparse.Namespace) -> None:
+    """Materialise the plugin UI SDK for frontend development."""
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        _fail(f"{out} is not empty")
+    out.mkdir(parents=True, exist_ok=True)
+    src = _sdk_dir()
+    for item in src.iterdir():
+        if item.is_file():
+            shutil.copy2(item, out / item.name)
+    contract = _ui_contract()
+    print(
+        f"plugin UI SDK {contract.get('sdk_version', '?')} -> {out}\n"
+        f"  {len(contract.get('classes') or {})} classes, "
+        f"{len(contract.get('modules') or [])} modules, "
+        f"{len(contract.get('rpc') or [])} RPC methods, "
+        f"{len(contract.get('slots') or {})} slots"
+    )
 
 
 # ── build ─────────────────────────────────────────────────────────────
 
 
 def _build_one(pkg_dir: Path, *, allowed_tiers: tuple[str, ...] | None = None, no_isolation: bool = False) -> dict[str, Any]:
-    """Validate + build one package and return its catalog entry.
+    """Validate policy, build the wheel/sdist, and return the catalog entry dict.
 
     Writes ``dist/ea-build-info.json`` alongside the wheel so the publish
     stage never re-hashes.  ``allowed_tiers`` widens the gate for the vendor
@@ -256,6 +591,15 @@ def _build_one(pkg_dir: Path, *, allowed_tiers: tuple[str, ...] | None = None, n
             print(f"  - {p}")
         raise SystemExit(1)
     dist = str(py["project"]["name"])
+    # Compile plugin frontend first: the manifest may reference ui/plugin.js,
+    # and the wheel must contain the compiled asset (installs never build).
+    frontend = _build_frontend(pkg_dir)
+    _validate_ui_references(manifest, pkg_dir)
+    if frontend and not _ui_module_referenced(manifest, UI_OUTPUT):
+        _fail(
+            f"compiled {UI_OUTPUT} is not referenced by the manifest; declare "
+            f'{{"kind":"js_module","spec":{{"path":"{UI_OUTPUT}"}}}} in contributes.ui_contributions'
+        )
     host = _host_python()
     if no_isolation:
         # A no-isolation build runs the backend in the host interpreter, so
@@ -294,6 +638,7 @@ def _build_one(pkg_dir: Path, *, allowed_tiers: tuple[str, ...] | None = None, n
 
 
 def cmd_build(args: argparse.Namespace) -> None:
+    """Build a single package: policy-check, produce wheel/sdist, write build-info JSON."""
     entry = _build_one(Path(args.pkg_dir).resolve())
     print(f"built {len(entry['artifacts'])} artifact(s); catalog entry -> dist/{BUILD_INFO}")
 
@@ -302,7 +647,7 @@ def cmd_build(args: argparse.Namespace) -> None:
 
 
 def cmd_vendor(args: argparse.Namespace) -> None:
-    """Batch-build every official EA package into a registry-ready staging dir.
+    """Batch-build every official EA package into a registry-ready staging directory.
 
     Walks ``--src`` for ``ea-tool-*`` / ``ea-skill-*`` / ``ea-plugin-*``
     directories, builds each wheel with the vendor tier gate (bundled
@@ -359,23 +704,26 @@ def cmd_vendor(args: argparse.Namespace) -> None:
 
 # ── verify ────────────────────────────────────────────────────────────
 
-_PROBE = """
-import importlib, json, sys
-module_name, _, factory = sys.argv[1].partition(":")
-plugin = getattr(importlib.import_module(module_name), factory)()
-print(json.dumps(plugin.manifest.to_dict()))
-"""
-
 
 def cmd_verify(args: argparse.Namespace) -> None:
+    """Install the built wheel into an isolated venv and probe the entry-point factory.
+
+    The probe venv uses ``--system-site-packages`` so the Encre Agent SDK
+    (not yet on PyPI during the 0.5.x transition) remains visible.  The
+    probe imports the entry-point factory, constructs the plugin, and
+    verifies its manifest has name and version set.
+    """
     pkg_dir = Path(args.pkg_dir).resolve()
     py = read_pyproject(pkg_dir)
+    source_manifest = _load_manifest(pkg_dir)
+    _validate_ui_references(source_manifest, pkg_dir)
     ep = find_ea_entrypoint(py)
     if ep is None:
         _fail("no ea.plugins entry point to verify")
     wheels = sorted((pkg_dir / "dist").glob("*.whl"))
     if not wheels:
         _fail("no wheel in dist/ — run `encre-plugin build` first")
+    _verify_wheel_ui_assets(wheels[-1], source_manifest)
     tmp = Path(tempfile.mkdtemp(prefix="ea-verify-"))
     try:
         py_bin = "Scripts/python.exe" if os.name == "nt" else "bin/python"
@@ -416,14 +764,14 @@ REGISTRY_URL = "https://github.com/mf2023/ea-cwh.git"
 
 
 def _registry_cache_dir() -> Path:
-    """Persistent home for the CLI-managed registry clone."""
+    """Return the persistent home directory for the CLI-managed registry clone."""
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
     root = Path(base) if base else Path.home() / ".cache"
     return root / "encre-plugin-cli" / "registry"
 
 
 def _resolve_registry(args: argparse.Namespace) -> Path:
-    """Local checkout to open the PR from: --registry-dir, else a cached clone.
+    """Resolve or create a local registry checkout for the PR operation.
 
     A missing cache clone is fetched shallowly from ``--registry-url``; an
     existing one is re-synced onto the remote's default branch so the entry
@@ -457,6 +805,12 @@ def _resolve_registry(args: argparse.Namespace) -> Path:
 
 
 def cmd_publish(args: argparse.Namespace) -> None:
+    """Upload the built wheel to PyPI and open a catalog PR against the registry.
+
+    Reads ``dist/ea-build-info.json`` (produced by ``build``) for the catalog
+    entry and artifact list.  ``--dry-run`` prints the payload without acting.
+    ``--no-upload`` skips twine and only opens the registry PR.
+    """
     pkg_dir = Path(args.pkg_dir).resolve()
     info_path = pkg_dir / "dist" / BUILD_INFO
     if not info_path.exists():
@@ -481,11 +835,12 @@ def cmd_publish(args: argparse.Namespace) -> None:
 
 
 def _registry_pr(registry: Path, entry: dict[str, Any]) -> None:
-    """Drop the catalog entry into the checkout and open the registry PR.
+    """Drop the catalog entry into the registry checkout and open a PR via gh CLI.
 
     The branch is cut from origin/main BEFORE the entry is written, so the
     PR can only ever carry the single catalogue file — never leftover
-    worktree state.
+    worktree state.  If ``gh pr create`` fails, the branch is left pushed
+    so the author can open the PR manually.
     """
     name, version = str(entry["name"]), str(entry["version"])
     branch = f"publish/{name}-{version}"
@@ -524,6 +879,12 @@ def _registry_pr(registry: Path, entry: dict[str, Any]) -> None:
 
 
 def cmd_catalog_regen(args: argparse.Namespace) -> None:
+    """Merge all catalog.d/*.json entry files into a single catalog.json document.
+
+    Imports ``validate_catalog`` from the ``ea_cwh`` package.  Refuses to
+    write when validation reports violations.  Sorting by name keeps diffs
+    stable across regenerations.
+    """
     from ea_cwh import validate_catalog
 
     registry = Path(args.registry)
@@ -545,6 +906,7 @@ def cmd_catalog_regen(args: argparse.Namespace) -> None:
 
 
 def cmd_catalog_check(args: argparse.Namespace) -> None:
+    """Validate a catalog.json file against the ea-cwh schema and exit non-zero on violation."""
     from ea_cwh import validate_catalog
 
     doc = json.loads(Path(args.file).read_text(encoding="utf-8"))
@@ -560,12 +922,20 @@ def cmd_catalog_check(args: argparse.Namespace) -> None:
 
 
 def _now() -> str:
+    """Return the current UTC time as an ISO-8601 timestamp with second precision."""
     from datetime import datetime
 
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Top-level CLI entry point: parse subcommands and dispatch to the matching handler.
+
+    Subcommands are registered via argparse subparsers.  Each handler is
+    a module-level function referenced by a ``set_defaults(fn=...)`` entry.
+    When invoked under ``__main__``, ``sys.exit(main())`` is called so
+    SystemExit propagates naturally.
+    """
     parser = argparse.ArgumentParser(prog="encre-plugin", description="Encre Agent plugin market unified CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -574,7 +944,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--dir", help="parent directory (default: cwd)")
     p.set_defaults(fn=cmd_init)
 
-    p = sub.add_parser("build", help="policy check + wheel/sdist + sha256 digests")
+    p = sub.add_parser("sdk", help="materialise the plugin UI SDK package")
+    p.add_argument("--out", default="encre-plugin-ui-sdk")
+    p.set_defaults(fn=cmd_sdk)
+
+    p = sub.add_parser("build", help="policy check + plugin UI compile + wheel/sdist + sha256 digests")
     p.add_argument("pkg_dir", nargs="?", default=".")
     p.set_defaults(fn=cmd_build)
 

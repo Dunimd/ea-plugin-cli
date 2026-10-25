@@ -1,0 +1,19 @@
+{
+  "name": "@encre/plugin-ui-sdk",
+  "version": "1.0.0",
+  "description": "Unified frontend SDK for Encre Agent plugins (EA-UI classes, components, RPC, slots and contributions)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "license": "Apache-2.0"
+}

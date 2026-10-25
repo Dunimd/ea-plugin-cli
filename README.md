@@ -47,8 +47,9 @@ Or as a module: pip install ea-plugin-cli   # development: pip install -e cli/
 
 | Command | Purpose |
 |:------|:------|
-| `encre-plugin init <name>` | Scaffold `ea-plugin-<name>` (pyproject + `ea.plugins` entry point + `create_plugin` factory + `ui/` directory) |
-| `encre-plugin build [pkg_dir]` | Run central-registry policy checks → `python -m build` (wheel + sdist) → sha256 per artifact → write `dist/ea-build-info.json` (draft catalog entry) |
+| `encre-plugin init <name>` | Scaffold `ea-plugin-<name>` (pyproject + `ea.plugins` entry point + `create_plugin` factory + `ui/src/index.ts` + vendored plugin UI SDK) |
+| `encre-plugin build [pkg_dir]` | Compile `ui/src/index.ts` → `ui/plugin.js`, validate every `ea-ui-*` / RPC / slot against the SDK contract, run central-registry policy checks → `python -m build` (wheel + sdist) → sha256 per artifact → write `dist/ea-build-info.json` |
+| `encre-plugin sdk [--out dir]` | Materialise the distributable `@encre/plugin-ui-sdk` package (runtime, types, contract.json) |
 | `encre-plugin vendor` | Official batch build: walk `core/ea_tools/*` (accepts the `ea-tool-`/`ea-skill-` namespaces and the `system-default` tier), build + digest each package with the same policy, stage `catalog.d/<name>.json` and wheels into `dist/vendor/` (staging only — no upload, no PR). Invoked by `python build.py vendor` |
 | `encre-plugin verify [pkg_dir]` | Install the wheel into a throwaway venv, import the entry-point factory and probe the manifest |
 | `encre-plugin publish [pkg_dir]` | `twine upload` to PyPI, then open a central-registry PR: the entry lands in the registry checkout's `catalog.d/`, git branch is cut from origin/main, committed, pushed, `gh pr create` |
@@ -72,7 +73,7 @@ Or as a module: pip install ea-plugin-cli   # development: pip install -e cli/
 | 2 | Must declare `[project.entry-points."ea.plugins"]`; **one wheel carries exactly one plugin** |
 | 3 | Manifest `name/version/description/author/license` must be non-empty, `manifest.version` must match the pyproject version, and `tier` must be `user` (vendor builds may also ship `system-default`) |
 | 4 | Must declare `min_ea_version` or `engines["encre"]` |
-| 5 | Packages that declare UI (`provides_ui` / `contributes.ui`) must ship it **pre-compiled** under `ui/` and include it as package data — the install side never executes builds |
+| 5 | Packages that declare UI (`provides_ui` / `contributes.ui*`) must ship it **pre-compiled** under `ui/` and include it as package data — the install side never executes builds. `encre-plugin build` compiles `ui/src/index.*` and rejects unknown `ea-ui-*` classes, RPC methods and slot ids |
 
 <h2 align="center">🔧 Environment Variables</h2>
 

@@ -1,6 +1,6 @@
 # Copyright © 2025-2026 Wenze Wei. All Rights Reserved.
 #
-# This file is part of Encre.
+# This file is part of Encre Agent.
 # The Encre project belongs to the Dunimd Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,3 +62,6 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "RUF"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ea_plugin_cli*"]
+
+[tool.setuptools.package-data]
+ea_plugin_cli = ["sdk_dist/*"]
